@@ -503,8 +503,8 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 		if err != nil {
 			return err
 		}
-		if sasToken != "" {
-			continue // A supplied SAS needs neither OAuth nor a new delegation key.
+		if accountKey(account) != "" || sasToken != "" {
+			continue // Explicit storage credentials need no OAuth delegation key.
 		}
 		// Pre-warm the UDC cache so SAS generation doesn't trigger
 		// a second credential acquisition later.
@@ -884,31 +884,46 @@ func accountKey(account string) string {
 	return os.Getenv("BBB_AZBLOB_ACCOUNTKEY")
 }
 
-// accountSASToken returns a supplied SAS only for its explicitly named account.
-// Requiring AZURE_STORAGE_ACCOUNT prevents a multi-account transfer from sending
-// a token intended for one account to a different account.
+// accountSASToken resolves SAS credentials like the existing role credentials:
+// SRC_/DST_ overrides the global default, and commands without a role use SRC.
+// Account and token are one pair so overrides cannot send a global token to a
+// different account. Shared keys retain precedence over supplied SAS tokens.
 func accountSASToken(account string) (string, error) {
-	token := strings.TrimPrefix(strings.TrimSpace(os.Getenv("AZURE_STORAGE_SAS_TOKEN")), "?")
+	if accountKey(account) != "" {
+		return "", nil
+	}
+	role := "SRC"
+	if roleVal, ok := accountRoles.Load(account); ok {
+		role = roleVal.(string)
+	}
+	prefix := ""
+	if os.Getenv(role+"_AZURE_STORAGE_SAS_TOKEN") != "" {
+		prefix = role + "_"
+	}
+	tokenName := prefix + "AZURE_STORAGE_SAS_TOKEN"
+	accountName := prefix + "AZURE_STORAGE_ACCOUNT"
+	token := strings.TrimSpace(os.Getenv(tokenName))
 	if token == "" {
 		return "", nil
 	}
-	scopedAccount := os.Getenv("AZURE_STORAGE_ACCOUNT")
+	scopedAccount := os.Getenv(accountName)
 	if scopedAccount == "" {
-		return "", errors.New("AZURE_STORAGE_ACCOUNT is required with AZURE_STORAGE_SAS_TOKEN")
+		return "", fmt.Errorf("%s is required with %s", accountName, tokenName)
 	}
 	if account != scopedAccount {
 		return "", nil
 	}
+	token = strings.TrimPrefix(token, "?")
 	query, err := url.ParseQuery(token)
 	if err != nil || query.Get("sig") == "" {
 		// Parse errors can contain token values; never include them in diagnostics.
-		return "", errors.New("AZURE_STORAGE_SAS_TOKEN must be a SAS query string containing sig")
+		return "", fmt.Errorf("%s must be a SAS query string containing sig", tokenName)
 	}
 	return token, nil
 }
 
 // getAzBlobClient returns an Azure Blob client for the given account using a
-// supplied SAS, a shared key, or an Azure identity credential, in that order.
+// shared key, a supplied SAS, or an Azure identity credential, in that order.
 // Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	// Check cache first.
@@ -921,22 +936,22 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 		return nil, err
 	}
 	var client *azblob.Client
-	if sasToken != "" {
+	if key := accountKey(account); key != "" {
+		cred, err := azblob.NewSharedKeyCredential(account, key)
+		if err != nil {
+			return nil, err
+		}
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, azblobClientOptions())
+		if err != nil {
+			return nil, err
+		}
+	} else if sasToken != "" {
 		serviceURL, parseErr := url.Parse(endpoint)
 		if parseErr != nil {
 			return nil, errors.New("invalid Blob service endpoint")
 		}
 		serviceURL.RawQuery = sasToken
 		client, err = azblob.NewClientWithNoCredential(serviceURL.String(), azblobClientOptions())
-		if err != nil {
-			return nil, err
-		}
-	} else if key := accountKey(account); key != "" {
-		cred, err := azblob.NewSharedKeyCredential(account, key)
-		if err != nil {
-			return nil, err
-		}
-		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, azblobClientOptions())
 		if err != nil {
 			return nil, err
 		}
