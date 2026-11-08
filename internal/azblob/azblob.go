@@ -499,6 +499,13 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 		if err != nil {
 			return fmt.Errorf("pre-authenticate %s: %w", account, err)
 		}
+		sasToken, err := accountSASToken(account)
+		if err != nil {
+			return err
+		}
+		if accountKey(account) != "" || sasToken != "" {
+			continue // Explicit storage credentials need no OAuth delegation key.
+		}
 		// Pre-warm the UDC cache so SAS generation doesn't trigger
 		// a second credential acquisition later.
 		_, _, _, _, err = getUDC(ctx, account)
@@ -877,8 +884,46 @@ func accountKey(account string) string {
 	return os.Getenv("BBB_AZBLOB_ACCOUNTKEY")
 }
 
-// getAzBlobClient returns an Azure Blob client for the given account using either a shared key
-// from BBB_AZBLOB_ACCOUNTKEY (or role-prefixed SRC_/DST_ variant) or the default Azure credential.
+// accountSASToken resolves SAS credentials like the existing role credentials:
+// SRC_/DST_ overrides the global default, and commands without a role use SRC.
+// Account and token are one pair so overrides cannot send a global token to a
+// different account. Shared keys retain precedence over supplied SAS tokens.
+func accountSASToken(account string) (string, error) {
+	if accountKey(account) != "" {
+		return "", nil
+	}
+	role := "SRC"
+	if roleVal, ok := accountRoles.Load(account); ok {
+		role = roleVal.(string)
+	}
+	prefix := ""
+	if os.Getenv(role+"_AZURE_STORAGE_SAS_TOKEN") != "" {
+		prefix = role + "_"
+	}
+	tokenName := prefix + "AZURE_STORAGE_SAS_TOKEN"
+	accountName := prefix + "AZURE_STORAGE_ACCOUNT"
+	token := strings.TrimSpace(os.Getenv(tokenName))
+	if token == "" {
+		return "", nil
+	}
+	scopedAccount := os.Getenv(accountName)
+	if scopedAccount == "" {
+		return "", fmt.Errorf("%s is required with %s", accountName, tokenName)
+	}
+	if account != scopedAccount {
+		return "", nil
+	}
+	token = strings.TrimPrefix(token, "?")
+	query, err := url.ParseQuery(token)
+	if err != nil || query.Get("sig") == "" {
+		// Parse errors can contain token values; never include them in diagnostics.
+		return "", fmt.Errorf("%s must be a SAS query string containing sig", tokenName)
+	}
+	return token, nil
+}
+
+// getAzBlobClient returns an Azure Blob client for the given account using a
+// shared key, a supplied SAS, or an Azure identity credential, in that order.
 // Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	// Check cache first.
@@ -886,6 +931,10 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 		return cached.(*azblob.Client), nil
 	}
 	endpoint := getEndpoint(account)
+	sasToken, err := accountSASToken(account)
+	if err != nil {
+		return nil, err
+	}
 	var client *azblob.Client
 	if key := accountKey(account); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
@@ -893,6 +942,16 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 			return nil, err
 		}
 		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, cred, azblobClientOptions())
+		if err != nil {
+			return nil, err
+		}
+	} else if sasToken != "" {
+		serviceURL, parseErr := url.Parse(endpoint)
+		if parseErr != nil {
+			return nil, errors.New("invalid Blob service endpoint")
+		}
+		serviceURL.RawQuery = sasToken
+		client, err = azblob.NewClientWithNoCredential(serviceURL.String(), azblobClientOptions())
 		if err != nil {
 			return nil, err
 		}
@@ -1810,10 +1869,10 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		return err
 	}
 	// Auth strategy for the source:
-	//   1. If a shared key is configured for the source account, skip the
+	//   1. If a SAS or shared key is configured for the source account, skip the
 	//      OAuth path and go straight to SAS — OAuth would trigger
 	//      DefaultAzureCredential probing (and could open an interactive
-	//      browser) in environments that intentionally use shared-key-only.
+	//      browser) when only SAS or shared-key authentication is intended.
 	//   2. Otherwise try OAuth: the destination uses our token to
 	//      authenticate against the source via x-ms-copy-source-authorization,
 	//      which unlocks Azure's intra-region fast path for
@@ -1823,7 +1882,11 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	//   3. Fall back to SAS when no OAuth credential is available (e.g.
 	//      cross-tenant copies).
 	var srcURL, srcAuth string
-	if accountKey(src.Account) != "" {
+	sasToken, err := accountSASToken(src.Account)
+	if err != nil {
+		return err
+	}
+	if sasToken != "" || accountKey(src.Account) != "" {
 		sasURL, sasErr := blobSASURL(ctx, src)
 		if sasErr != nil {
 			return sasErr
@@ -2375,6 +2438,17 @@ func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCre
 }
 
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	sasToken, err := accountSASToken(ap.Account)
+	if err != nil {
+		return "", err
+	}
+	if sasToken != "" {
+		client, err := getAzBlobClient(ctx, ap.Account)
+		if err != nil {
+			return "", err
+		}
+		return client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob).URL(), nil
+	}
 	if accountKey(ap.Account) != "" {
 		client, err := getAzBlobClient(ctx, ap.Account)
 		if err != nil {
