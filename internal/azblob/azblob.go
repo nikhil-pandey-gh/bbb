@@ -499,6 +499,13 @@ func PreAuthenticate(ctx context.Context, accounts ...string) error {
 		if err != nil {
 			return fmt.Errorf("pre-authenticate %s: %w", account, err)
 		}
+		sasToken, err := accountSASToken(account)
+		if err != nil {
+			return err
+		}
+		if sasToken != "" {
+			continue // A supplied SAS needs neither OAuth nor a new delegation key.
+		}
 		// Pre-warm the UDC cache so SAS generation doesn't trigger
 		// a second credential acquisition later.
 		_, _, _, _, err = getUDC(ctx, account)
@@ -877,8 +884,31 @@ func accountKey(account string) string {
 	return os.Getenv("BBB_AZBLOB_ACCOUNTKEY")
 }
 
-// getAzBlobClient returns an Azure Blob client for the given account using either a shared key
-// from BBB_AZBLOB_ACCOUNTKEY (or role-prefixed SRC_/DST_ variant) or the default Azure credential.
+// accountSASToken returns a supplied SAS only for its explicitly named account.
+// Requiring AZURE_STORAGE_ACCOUNT prevents a multi-account transfer from sending
+// a token intended for one account to a different account.
+func accountSASToken(account string) (string, error) {
+	token := strings.TrimPrefix(strings.TrimSpace(os.Getenv("AZURE_STORAGE_SAS_TOKEN")), "?")
+	if token == "" {
+		return "", nil
+	}
+	scopedAccount := os.Getenv("AZURE_STORAGE_ACCOUNT")
+	if scopedAccount == "" {
+		return "", errors.New("AZURE_STORAGE_ACCOUNT is required with AZURE_STORAGE_SAS_TOKEN")
+	}
+	if account != scopedAccount {
+		return "", nil
+	}
+	query, err := url.ParseQuery(token)
+	if err != nil || query.Get("sig") == "" {
+		// Parse errors can contain token values; never include them in diagnostics.
+		return "", errors.New("AZURE_STORAGE_SAS_TOKEN must be a SAS query string containing sig")
+	}
+	return token, nil
+}
+
+// getAzBlobClient returns an Azure Blob client for the given account using a
+// supplied SAS, a shared key, or an Azure identity credential, in that order.
 // Clients are cached per account for the process lifetime.
 func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error) {
 	// Check cache first.
@@ -886,8 +916,22 @@ func getAzBlobClient(ctx context.Context, account string) (*azblob.Client, error
 		return cached.(*azblob.Client), nil
 	}
 	endpoint := getEndpoint(account)
+	sasToken, err := accountSASToken(account)
+	if err != nil {
+		return nil, err
+	}
 	var client *azblob.Client
-	if key := accountKey(account); key != "" {
+	if sasToken != "" {
+		serviceURL, parseErr := url.Parse(endpoint)
+		if parseErr != nil {
+			return nil, errors.New("invalid Blob service endpoint")
+		}
+		serviceURL.RawQuery = sasToken
+		client, err = azblob.NewClientWithNoCredential(serviceURL.String(), azblobClientOptions())
+		if err != nil {
+			return nil, err
+		}
+	} else if key := accountKey(account); key != "" {
 		cred, err := azblob.NewSharedKeyCredential(account, key)
 		if err != nil {
 			return nil, err
@@ -1810,10 +1854,10 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 		return err
 	}
 	// Auth strategy for the source:
-	//   1. If a shared key is configured for the source account, skip the
+	//   1. If a SAS or shared key is configured for the source account, skip the
 	//      OAuth path and go straight to SAS — OAuth would trigger
 	//      DefaultAzureCredential probing (and could open an interactive
-	//      browser) in environments that intentionally use shared-key-only.
+	//      browser) when only SAS or shared-key authentication is intended.
 	//   2. Otherwise try OAuth: the destination uses our token to
 	//      authenticate against the source via x-ms-copy-source-authorization,
 	//      which unlocks Azure's intra-region fast path for
@@ -1823,7 +1867,11 @@ func CopyBlobServerSide(ctx context.Context, src AzurePath, dst AzurePath, concu
 	//   3. Fall back to SAS when no OAuth credential is available (e.g.
 	//      cross-tenant copies).
 	var srcURL, srcAuth string
-	if accountKey(src.Account) != "" {
+	sasToken, err := accountSASToken(src.Account)
+	if err != nil {
+		return err
+	}
+	if sasToken != "" || accountKey(src.Account) != "" {
 		sasURL, sasErr := blobSASURL(ctx, src)
 		if sasErr != nil {
 			return sasErr
@@ -2375,6 +2423,17 @@ func refreshUDC(ctx context.Context, account string) (*service.UserDelegationCre
 }
 
 func blobSASURL(ctx context.Context, ap AzurePath) (string, error) {
+	sasToken, err := accountSASToken(ap.Account)
+	if err != nil {
+		return "", err
+	}
+	if sasToken != "" {
+		client, err := getAzBlobClient(ctx, ap.Account)
+		if err != nil {
+			return "", err
+		}
+		return client.ServiceClient().NewContainerClient(ap.Container).NewBlobClient(ap.Blob).URL(), nil
+	}
 	if accountKey(ap.Account) != "" {
 		client, err := getAzBlobClient(ctx, ap.Account)
 		if err != nil {

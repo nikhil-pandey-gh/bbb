@@ -263,6 +263,8 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_DNS_CACHE` | *(off)* | Set to `1` or `true` to enable process-local DNS caching |
 | `BBB_DNS_PIN` | *(off)* | Set to `1` or `true` to pin DNS to a single IP (implies `BBB_DNS_CACHE=1`) |
 | `BBB_AZBLOB_ACCOUNTKEY` | | Azure Storage shared key for all accounts |
+| `AZURE_STORAGE_ACCOUNT` | | Storage account the supplied `AZURE_STORAGE_SAS_TOKEN` belongs to; required when a SAS is set |
+| `AZURE_STORAGE_SAS_TOKEN` | | Existing SAS query string, optionally beginning with `?`; takes precedence over shared keys and Azure identity for the named account |
 | `HF_TOKEN` | | Hugging Face user access token; takes precedence over a saved login |
 | `HUGGING_FACE_HUB_TOKEN` | | Legacy fallback for `HF_TOKEN` |
 | `HF_TOKEN_PATH` | `$HF_HOME/token` | Hugging Face saved token file |
@@ -289,6 +291,31 @@ The `DNS lookup` line shows the resolved IP addresses for the storage account, a
 | `BBB_RETRY_JITTER` | *(off)* | Go duration (e.g. `500ms`, `2s`) to wait a random amount of time in `[0, value)` before each retry attempt. Applies to all operations that honour `--retry-count` |
 
 ### Non-Interactive Authentication (`AZURE_*` Env Vars)
+
+#### Existing SAS tokens
+
+Set `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_SAS_TOKEN` to use an existing service, account, or user delegation SAS.
+The token is sent only to the named account. No Azure CLI login, browser login, or delegation-key request is needed
+for that account, and a rejected or expired SAS is reported without falling back to another identity.
+
+```bash
+export AZURE_STORAGE_ACCOUNT=myaccount
+export AZURE_STORAGE_CONTAINER=mycontainer
+export AZURE_STORAGE_SAS_TOKEN='<existing-SAS-query-string>'
+
+bbb ls "az://${AZURE_STORAGE_ACCOUNT}/${AZURE_STORAGE_CONTAINER}/"
+bbb cp ./file.bin "az://${AZURE_STORAGE_ACCOUNT}/${AZURE_STORAGE_CONTAINER}/file.bin"
+bbb cp "az://${AZURE_STORAGE_ACCOUNT}/${AZURE_STORAGE_CONTAINER}/file.bin" ./download.bin
+```
+
+`AZURE_STORAGE_CONTAINER` is used by the shell examples; bbb gets the container from each path. The SAS retains its
+original scope, permissions, and expiry. A container SAS supports authorized operations within that container,
+including listing blobs, uploading, downloading, deleting, and server-side copying. It cannot list all containers or
+create containers. Server-side copies reuse the supplied SAS rather than minting another token. Other accounts in
+the same invocation continue to use their configured credentials. SAS tokens embedded in input path URLs are not
+used for authentication; pass the token through the environment instead.
+
+#### Azure identity credentials
 
 By default, when bbb cannot find shared keys or role-specific credentials it discovers the storage account's tenant and authenticates via the Azure CLI, falling back to an interactive browser login. For CI/CD and other headless environments, set the standard `AZURE_*` environment variables to authenticate non-interactively:
 
@@ -359,10 +386,11 @@ bbb sync az://src-account/data/ az://dst-account/data/
 
 **Credential resolution order** (first match wins):
 
-1. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
-2. Role env credential via `DefaultAzureCredential` — `SRC_AZURE_*` / `DST_AZURE_*`, falling back to unprefixed `AZURE_*` defaults. Accounts without an explicit role (single-endpoint commands like `ls`/`cat`/`rm`) reuse the `SRC` role, so unprefixed `AZURE_*` (and `SRC_AZURE_*`) are honored for them.
-3. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
-4. Interactive browser login (fallback)
+1. Supplied SAS (`AZURE_STORAGE_SAS_TOKEN`, scoped to `AZURE_STORAGE_ACCOUNT`)
+2. Shared key (`SRC_BBB_AZBLOB_ACCOUNTKEY` / `DST_BBB_AZBLOB_ACCOUNTKEY`, or `BBB_AZBLOB_ACCOUNTKEY`)
+3. Role env credential via `DefaultAzureCredential` — `SRC_AZURE_*` / `DST_AZURE_*`, falling back to unprefixed `AZURE_*` defaults. Accounts without an explicit role (single-endpoint commands like `ls`/`cat`/`rm`) reuse the `SRC` role, so unprefixed `AZURE_*` (and `SRC_AZURE_*`) are honored for them.
+4. Tenant-specific AzureCLI credential (auto-discovered from storage endpoint)
+5. Interactive browser login (fallback)
 
 ### Amazon S3 (`s3://`) Authentication and Configuration
 
